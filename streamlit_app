@@ -1,0 +1,40 @@
+import streamlit as st
+import pandas as pd
+from pathlib import Path
+from src.data_io import load_flo_csv
+from src.cltv_bg_gammadist import build_cltv
+from src.rfm import build_rfm
+from src.clustering import build_model_features, kmeans_segments
+
+st.set_page_config(page_title="Customer Analytics Suite", layout="wide")
+st.title("Customer Analytics Suite – CLTV • RFM • Segmentation")
+
+data_path = st.text_input("Path to flo_data_20k.csv", "data/flo_data_20k.csv")
+if not Path(data_path).exists():
+    st.warning("Upload or point to the dataset path, then rerun.")
+    st.stop()
+
+df = load_flo_csv(data_path)
+
+tab1, tab2, tab3 = st.tabs(["CLTV (BG/NBD + Gamma-Gamma)", "RFM", "Clustering"])
+
+with tab1:
+    st.subheader("6-month CLTV (probabilistic)")
+    cltv = build_cltv(df)
+    st.metric("Median CLTV", f"{cltv['cltv'].median():.2f}")
+    st.dataframe(cltv.head(20))
+    st.download_button("Download CLTV CSV", cltv.to_csv(index=False), "cltv.csv")
+
+with tab2:
+    st.subheader("RFM Segments")
+    rfm = build_rfm(df)
+    st.dataframe(rfm.head(20))
+    seg_stats = rfm.groupby("segment")[["recency","frequency","monetary"]].agg(["mean","count"])
+    st.write(seg_stats)
+
+with tab3:
+    st.subheader("K-Means Clustering (k=7)")
+    mdf = build_model_features(df)
+    labels = kmeans_segments(mdf, k=7)
+    out = pd.DataFrame({"label": labels})
+    st.dataframe(out["label"].value_counts())
