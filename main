@@ -1,5 +1,5 @@
-# src/data_io.py
-from __future__ import annotations
+# src/data_io
+
 import pandas as pd
 from pathlib import Path
 
