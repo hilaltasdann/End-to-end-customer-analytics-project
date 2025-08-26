@@ -1,0 +1,169 @@
+# src/data_io.py
+from __future__ import annotations
+import pandas as pd
+from pathlib import Path
+
+def load_flo_csv(path: str | Path) -> pd.DataFrame:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Dataset not found: {p.resolve()}")
+    df = pd.read_csv(p)
+    return df
+
+# src/utils.py
+import pandas as pd
+import numpy as np
+
+def cap_outliers(df: pd.DataFrame, cols: list[str], q_low=0.01, q_hi=0.99) -> pd.DataFrame:
+    for c in cols:
+        q1 = df[c].quantile(q_low)
+        q3 = df[c].quantile(q_hi)
+        iqr = q3 - q1
+        low = q1 - 1.5 * iqr
+        high = q3 + 1.5 * iqr
+        df.loc[df[c] < low, c] = round(low, 0)
+        df.loc[df[c] > high, c] = round(high, 0)
+    return df
+
+def add_omni_totals(df: pd.DataFrame) -> pd.DataFrame:
+    df["order_num_total"]    = df["order_num_total_ever_online"] + df["order_num_total_ever_offline"]
+    df["customer_value_total"] = df["customer_value_total_ever_online"] + df["customer_value_total_ever_offline"]
+    return df
+
+def to_datetime_cols(df: pd.DataFrame, pat="date") -> pd.DataFrame:
+    date_cols = df.columns[df.columns.str.contains(pat)]
+    df[date_cols] = df[date_cols].apply(pd.to_datetime)
+    return df
+
+# src/cltv_bg_gammadist.py (Probabilistic CLTV)
+from __future__ import annotations
+import pandas as pd, datetime as dt
+from lifetimes import BetaGeoFitter, GammaGammaFitter
+from .utils import cap_outliers, add_omni_totals, to_datetime_cols
+
+def build_cltv(df_raw: pd.DataFrame,
+               analysis_date: dt.datetime | None = None) -> pd.DataFrame:
+    df = df_raw.copy()
+    df = cap_outliers(df, [
+        "order_num_total_ever_online", "order_num_total_ever_offline",
+        "customer_value_total_ever_online", "customer_value_total_ever_offline"
+    ])
+    df = add_omni_totals(df)
+    df = df[df["order_num_total"] > 0]  # drop zero-purchase rows
+    df = to_datetime_cols(df)
+
+    if analysis_date is None:
+        analysis_date = df["last_order_date"].max() + pd.Timedelta(days=2)
+
+    cltv = pd.DataFrame({
+        "customer_id": df["master_id"],
+        "recency_cltv_weekly":
+            ((df["last_order_date"] - df["first_order_date"]).astype("timedelta64[D]")) / 7,
+        "T_weekly":
+            ((analysis_date - df["first_order_date"]).astype("timedelta64[D]")) / 7,
+        "frequency": df["order_num_total"],
+        "monetary_cltv_avg": df["customer_value_total"] / df["order_num_total"]
+    })
+
+    # BG/NBD
+    bgf = BetaGeoFitter(penalizer_coef=0.001)
+    bgf.fit(cltv["frequency"], cltv["recency_cltv_weekly"], cltv["T_weekly"])
+    cltv["exp_sales_3_month"] = bgf.predict(4*3, cltv["frequency"], cltv["recency_cltv_weekly"], cltv["T_weekly"])
+    cltv["exp_sales_6_month"] = bgf.predict(4*6, cltv["frequency"], cltv["recency_cltv_weekly"], cltv["T_weekly"])
+
+    # Gamma-Gamma
+    ggf = GammaGammaFitter(penalizer_coef=0.01)
+    ggf.fit(cltv["frequency"], cltv["monetary_cltv_avg"])
+    cltv["exp_average_value"] = ggf.conditional_expected_average_profit(
+        cltv["frequency"], cltv["monetary_cltv_avg"]
+    )
+
+    cltv["cltv"] = ggf.customer_lifetime_value(
+        bgf,
+        cltv["frequency"],
+        cltv["recency_cltv_weekly"],
+        cltv["T_weekly"],
+        cltv["monetary_cltv_avg"],
+        time=6,  # months
+        freq="W",
+        discount_rate=0.01
+    )
+    cltv["cltv_segment"] = pd.qcut(cltv["cltv"], 4, labels=["D", "C", "B", "A"])
+    return cltv
+
+# src/rfm.py
+from __future__ import annotations
+import pandas as pd, datetime as dt
+from .utils import add_omni_totals, to_datetime_cols
+
+SEG_MAP = {
+    r"[1-2][1-2]": "hibernating",
+    r"[1-2][3-4]": "at_Risk",
+    r"[1-2]5": "cant_loose",
+    r"3[1-2]": "about_to_sleep",
+    r"33": "need_attention",
+    r"[3-4][4-5]": "loyal_customers",
+    r"41": "promising",
+    r"51": "new_customers",
+    r"[4-5][2-3]": "potential_loyalists",
+    r"5[4-5]": "champions",
+}
+
+def build_rfm(df_raw: pd.DataFrame,
+              analysis_date: dt.datetime | None = None) -> pd.DataFrame:
+    df = df_raw.copy()
+    df = add_omni_totals(df)
+    df = to_datetime_cols(df)
+
+    if analysis_date is None:
+        analysis_date = df["last_order_date"].max() + pd.Timedelta(days=2)
+
+    rfm = pd.DataFrame({
+        "customer_id": df["master_id"],
+        "recency": (analysis_date - df["last_order_date"]).astype("timedelta64[D]"),
+        "frequency": df["order_num_total"],
+        "monetary": df["customer_value_total"],
+    })
+
+    rfm["recency_score"]   = pd.qcut(rfm["recency"], 5, labels=[5,4,3,2,1])
+    rfm["frequency_score"] = pd.qcut(rfm["frequency"].rank(method="first"), 5, labels=[1,2,3,4,5])
+    rfm["monetary_score"]  = pd.qcut(rfm["monetary"], 5, labels=[1,2,3,4,5])
+
+    rfm["RF_SCORE"]  = rfm["recency_score"].astype(str) + rfm["frequency_score"].astype(str)
+    rfm["RFM_SCORE"] = rfm["RF_SCORE"] + rfm["monetary_score"].astype(str)
+    rfm["segment"] = rfm["RF_SCORE"].replace(SEG_MAP, regex=True)
+
+    return rfm
+
+# src/clustering.py
+from __future__ import annotations
+import pandas as pd, numpy as np, datetime as dt
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.cluster import KMeans, AgglomerativeClustering
+from scipy.cluster.hierarchy import linkage
+from .utils import to_datetime_cols
+
+def build_model_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df = to_datetime_cols(df)
+    analysis_date = df["last_order_date"].max() + pd.Timedelta(days=2)
+    df["recency"] = (analysis_date - df["last_order_date"]).astype("timedelta64[D]")
+    df["tenure"]  = (df["last_order_date"] - df["first_order_date"]).astype("timedelta64[D]")
+
+    model_df = df[[
+        "order_num_total_ever_online","order_num_total_ever_offline",
+        "customer_value_total_ever_online","customer_value_total_ever_offline",
+        "recency","tenure"
+    ]].copy()
+
+    for c in model_df.columns:
+        model_df[c] = np.log1p(model_df[c])
+    model_df[:] = MinMaxScaler().fit_transform(model_df)
+    return model_df
+
+def kmeans_segments(model_df: pd.DataFrame, k: int = 7, random_state: int = 42) -> np.ndarray:
+    return KMeans(n_clusters=k, random_state=random_state).fit_predict(model_df)
+
+def hierarchical_segments(model_df: pd.DataFrame, n_clusters: int = 5) -> np.ndarray:
+    _ = linkage(model_df, method="complete")  # (useful for dendrogram in notebooks)
+    return AgglomerativeClustering(n_clusters=n_clusters).fit_predict(model_df)
